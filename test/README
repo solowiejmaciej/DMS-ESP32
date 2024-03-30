@@ -1,0 +1,136 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <ArduinoJson.hpp>
+#include <WiFiUdp.h>
+
+const int INTERNAL_LED = 2;
+const int EXTERNAL_LED = 15;
+// put function declarations here:
+void turnOnLed(int pinNumber);
+void turnOffLed(int pinNumber);
+
+void reconnectToMqtt();
+void configureWiFi();
+void configureMqtt();
+void callback(char *topic, byte *message, unsigned int length);
+
+const char *ssid = "INEA-73EF_2.4G";
+const char *password = "8689450570";
+
+const char *mqtt_server_ip = "d7f63eb1c4a14248a3dfc2d032fbb00c.s1.eu.hivemq.cloud";
+const int mqtt_server_port = 8883;
+const char *mqttUser = "esp32";
+const char \*mqttPassword = "zaq1@WSX";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+void setup()
+{
+Serial.begin(115200);
+delay(100);
+pinMode(EXTERNAL_LED, OUTPUT);
+pinMode(INTERNAL_LED, OUTPUT);
+turnOnLed(INTERNAL_LED);
+configureWiFi();
+configureMqtt();
+turnOffLed(INTERNAL_LED);
+
+if (!mqttClient.connected())
+{
+reconnectToMqtt();
+}
+}
+
+void loop()
+{
+if (!mqttClient.connected())
+{
+reconnectToMqtt();
+}
+mqttClient.loop();
+}
+
+void configureWiFi()
+{
+
+WiFi.mode(WIFI_STA); // Optional
+WiFi.begin(ssid, password);
+Serial.print("\nConnecting to wifi.");
+
+while (WiFi.status() != WL_CONNECTED)
+{
+Serial.print(".");
+delay(100);
+}
+
+Serial.println("\nConnected to the WiFi network");
+Serial.print("Local ESP32 IP: ");
+Serial.println(WiFi.localIP());
+}
+
+void configureMqtt()
+{
+mqttClient.setServer(mqtt_server_ip, mqtt_server_port);
+mqttClient.setCallback(callback);
+
+reconnectToMqtt();
+}
+
+void turnOnLed(int pinNumber)
+{
+digitalWrite(pinNumber, HIGH);
+}
+
+void turnOffLed(int pinNumber)
+{
+digitalWrite(pinNumber, LOW);
+}
+
+// On message received
+void callback(char *topic, byte *message, unsigned int length)
+{
+const size_t capacity = JSON_OBJECT_SIZE(10);
+
+DynamicJsonDocument parsed(capacity);
+DeserializationError error = deserializeJson(parsed, message);
+
+if (error)
+{
+Serial.println("Failed to parse JSON");
+Serial.println(error.c_str());
+return;
+}
+
+if (String(topic) == "/api/missyou")
+{
+Serial.println("Miss you message received");
+}
+}
+
+void reconnectToMqtt()
+{
+// Loop until we're reconnected
+while (!mqttClient.connected())
+{
+
+    Serial.println("Attempting MQTT connection...");
+    String clientId = "ESP32Client";
+    clientId += String(random(0xffff), HEX);
+    // Attempt to connect
+    if (mqttClient.connect(clientId.c_str()))
+    {
+      mqttClient.subscribe("/api/missyou");
+      Serial.println("Successfully connected to MQTT server");
+    }
+    else
+    {
+      Serial.println("failed, rc=");
+      Serial.print(mqttClient.state());
+      delay(5000);
+    }
+
+}
+}
