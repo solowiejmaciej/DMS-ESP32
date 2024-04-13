@@ -17,6 +17,7 @@ DMSManager::DMSManager() : _mqttClient(_secureWifiClient) {}
 
 void DMSManager::setup(const DMSOptions &options)
 {
+    sayHello();
     _options = options;
     _previousMillis = 0;
     _root_ca = R"EOF(
@@ -52,14 +53,20 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )EOF";
+    int isReady = 0;
+    while (isReady != 1)
+    {
 
-    pinMode(_internalLed, OUTPUT);
-    turnOnLed(_internalLed);
-    configureWiFi();
-    putDefaultValuesInNVS();
-    configureDMS();
-    configureMqtt();
-    turnOffLed(_internalLed);
+        configureWiFi();
+        putDefaultValuesInNVS();
+        activateInDMS();
+        configureRemoteConfig();
+        pinMode(_internalLed, OUTPUT);
+        turnOnLed(_internalLed);
+        configureMqtt();
+        turnOffLed(_internalLed);
+        isReady = 1;
+    }
 }
 
 void DMSManager::loop()
@@ -82,13 +89,10 @@ void DMSManager::configureWiFi()
 {
     WiFi.mode(WIFI_STA);
     WiFi.begin(_options.ssid, _options.password);
-    Serial.print("\nConnecting to WiFi.");
     while (WiFi.status() != WL_CONNECTED)
     {
         delay(500);
-        Serial.print(".");
     }
-    Serial.println("\nWiFi connected.");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
 }
@@ -106,11 +110,10 @@ void DMSManager::reconnectToMqtt()
 {
     while (!_mqttClient.connected())
     {
-        Serial.print("Attempting MQTT connection… ");
         String clientId = "ESP32Client-" + getDeviceId();
         if (_mqttClient.connect(clientId.c_str(), _mqttUser.c_str(), _mqttPassword.c_str()))
         {
-            Serial.println("connected");
+            Serial.println("MQTT connected.");
             String rebootTopic = "/api/" + getDeviceId() + "/reboot";
             _mqttClient.subscribe(rebootTopic.c_str());
             String updateTopic = "/api/" + getDeviceId() + "/update";
@@ -158,7 +161,8 @@ void DMSManager::callback(char *topic, byte *message, unsigned int length)
     else if (String(topic) == updateTopic)
     {
         Serial.println("Update command received");
-        handleOTA();
+        String softwareVersion = parsed["software_version"].as<String>();
+        handleOTA(softwareVersion);
     }
 }
 
@@ -172,71 +176,26 @@ void DMSManager::turnOffLed(int pinNumber)
     digitalWrite(pinNumber, LOW);
 }
 
-String DMSManager::generateGUID()
-{
-    uint8_t baseMac[6];
-    esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
-    char baseMacChr[18] = {0};
-    sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X",
-            baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
-
-    String guid = String(baseMacChr);
-    guid.replace(":", "");
-    return guid;
-}
-
-void DMSManager::addPKCS7Padding(byte *data, size_t dataLen, size_t paddedDataLen)
-{
-    byte paddingValue = paddedDataLen - dataLen;
-    memset(data + dataLen, paddingValue, paddingValue);
-}
-
-String DMSManager::aesEncrypt(String plainText)
-{
-    size_t plainTextLen = plainText.length();
-    size_t paddedLength = (plainTextLen + 15) & ~15;
-    byte paddedText[paddedLength];
-    memcpy(paddedText, plainText.c_str(), plainTextLen);
-    addPKCS7Padding(paddedText, plainTextLen, paddedLength);
-
-    byte encryptedText[paddedLength];
-
-    mbedtls_aes_context aes;
-    mbedtls_aes_init(&aes);
-    mbedtls_aes_setkey_enc(&aes, _dmsKey, 256); // Ustawiamy klucz 256-bitowy
-    mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, paddedLength, (byte *)_dmsIV, paddedText, encryptedText);
-    mbedtls_aes_free(&aes);
-
-    // Konwersja zaszyfrowanego tekstu do Base64
-    size_t outputLen = 0;
-    byte base64Buffer[4 * ((paddedLength + 2) / 3) + 1]; // Bufor na zakodowaną wiadomość Base64
-
-    mbedtls_base64_encode(base64Buffer, sizeof(base64Buffer), &outputLen, encryptedText, paddedLength);
-
-    return String((char *)base64Buffer);
-}
-
 void DMSManager::activateInDMS()
 {
-    String deviceToken = getDeviceToken();
+    String deviceToken = getDeviceId();
 
-    StaticJsonDocument<200> body;
-    body["device_token"] = deviceToken;
-    String message;
-    serializeJson(body, message);
-
-    String url = String(_options.dmsUrl) + "/api/activate";
+    String url = String(_options.dmsUrl) + "/api/activate/" + deviceToken;
 
     HTTPClient http;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", _options.apiKey);
 
-    int httpResponseCode = http.POST(message);
+    int httpResponseCode = http.POST("{}");
 
-    if (httpResponseCode > 0)
+    if (httpResponseCode == 201)
     {
-        Serial.println("Device activited in DMS");
-        writeToNVS("is_active", "1");
+        Serial.println("Device activated in DMS");
+    }
+    else if (httpResponseCode == 400)
+    {
+        Serial.println("Device already activated in DMS");
     }
     else
     {
@@ -249,20 +208,12 @@ void DMSManager::activateInDMS()
 
 void DMSManager::putDefaultValuesInNVS()
 {
-    String deviceToken = readFromNVS("device_token");
+    String deviceToken = readFromNVS("device_id");
     if (deviceToken == "")
     {
         Serial.println("Device token is empty in NVS, putting default");
         String deviceId = getDeviceId();
-        deviceToken = aesEncrypt(deviceId);
-        writeToNVS("device_token", deviceToken);
-    }
-
-    String isActive = readFromNVS("is_active");
-    if (isActive != "1")
-    {
-        Serial.println("Setting device as not active");
-        writeToNVS("is_active", "0");
+        writeToNVS("device_id", deviceId);
     }
 }
 
@@ -308,22 +259,15 @@ bool DMSManager::writeToNVS(const char *key, const String &value)
 
 String DMSManager::getDeviceId()
 {
-    return generateGUID();
-}
+    uint8_t baseMac[6];
+    esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
+    char baseMacChr[18] = {0};
+    sprintf(baseMacChr, "%02X:%02X:%02X:%02X:%02X:%02X",
+            baseMac[0], baseMac[1], baseMac[2], baseMac[3], baseMac[4], baseMac[5]);
 
-String DMSManager::getDeviceToken()
-{
-    String deviceToken = readFromNVS("device_token");
-    if (deviceToken == "")
-    {
-        Serial.println("Device token is null, generating new one");
-        String deviceId = getDeviceId();
-        String deviceToken = aesEncrypt(deviceId);
-
-        writeToNVS("device_token", deviceToken);
-        return deviceToken;
-    }
-    return deviceToken;
+    String guid = String(baseMacChr);
+    guid.replace(":", "");
+    return guid;
 }
 
 void DMSManager::publishAliveEvent()
@@ -338,15 +282,14 @@ void DMSManager::publishAliveEvent()
 
 void DMSManager::configureRemoteConfig()
 {
-    Serial.println("Begin configuring device");
-    String deviceToken = getDeviceToken();
+    String deviceToken = getDeviceId();
     Serial.println("Device token: " + deviceToken);
-    String url = String(_options.dmsUrl) + "/api/configuration";
+    String url = String(_options.dmsUrl) + "/api/configuration/" + deviceToken;
 
     HTTPClient http;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", deviceToken);
+    http.addHeader("X-Api-Key", _options.apiKey);
 
     int httpResponseCode = http.GET();
 
@@ -371,15 +314,7 @@ void DMSManager::configureRemoteConfig()
         _aliveInterval = doc["AliveInterval"].as<unsigned long>();
         _deviceModel = doc["DeviceModel"].as<String>();
         _deviceBoardType = doc["DeviceBoardType"].as<String>();
-        _softwareVersion = doc["SoftwareVersion"].as<String>();
-        String dmsKeyString = doc["DmsKey"].as<String>();
-        String dmsIVString = doc["DmsIV"].as<String>();
-        _internalLed = doc["InternalLed"].as<unsigned int>();
-
-        hexStringToByteArray(dmsKeyString, _dmsKey, sizeof(32));
-        hexStringToByteArray(dmsIVString, _dmsIV, sizeof(16));
-
-        Serial.println("Configuration done");
+        _internalLed = doc["InternalLedPin"].as<unsigned int>();
     }
     else
     {
@@ -390,14 +325,20 @@ void DMSManager::configureRemoteConfig()
     http.end();
 }
 
-void DMSManager::handleOTA()
+void DMSManager::handleOTA(String softwareVersion)
 {
     Serial.println("Update started");
-    String deviceToken = getDeviceToken();
-    String url = String(_options.dmsUrl) + "/api/device/" + getDeviceId() + "/firmware";
+
+    StaticJsonDocument<200> doc;
+    doc["software_version"] = softwareVersion;
+    String body;
+    serializeJson(doc, body);
+
+    String url = String(_options.dmsUrl) + "/api/device/" + getDeviceId() + "/firmware?software_version=" + softwareVersion;
     HTTPClient http;
     http.begin(url);
-    http.addHeader("Authorization", deviceToken);
+    http.addHeader("X-Api-Key", _options.apiKey);
+    
     int httpCode = http.GET();
 
     if (httpCode == HTTP_CODE_OK)
@@ -446,29 +387,15 @@ void DMSManager::handleOTA()
         Serial.println("Error on HTTP request");
     }
 }
-void DMSManager::configureDMS()
-{
 
-    if (readFromNVS("is_active") != "1")
-    {
-        Serial.println("Device is not active, trying to activate...");
-        activateInDMS();
-    }
-    else
-    {
-        Serial.println("Device is already active");
-    }
-
-    if (readFromNVS("is_active") == "1")
-    {
-        configureRemoteConfig();
-    }
-}
-void DMSManager::hexStringToByteArray(String hexString, byte *byteArray, int byteArrayLength)
+void DMSManager::sayHello()
 {
-    for (int i = 0; i < byteArrayLength; i++)
-    {
-        String byteString = hexString.substring(i * 2, i * 2 + 2);
-        byteArray[i] = (byte)strtol(byteString.c_str(), NULL, 16);
-    }
+    Serial.println(" /$$$$$$$  /$$      /$$  /$$$$$$");
+    Serial.println("| $$__  $$| $$$    /$$$ /$$__  $$");
+    Serial.println("| $$  \ $$| $$$$  /$$$$| $$  \__/");
+    Serial.println("| $$  | $$| $$ $$/$$ $$|  $$$$$$");
+    Serial.println("| $$  | $$| $$  $$$| $$ \____  $$");
+    Serial.println("| $$  | $$| $$\  $ | $$ /$$  \ $$");
+    Serial.println("| $$$$$$$/| $$ \/  | $$|  $$$$$$/");
+    Serial.println("|_______/ |__/     |__/ \______/ ");
 }
